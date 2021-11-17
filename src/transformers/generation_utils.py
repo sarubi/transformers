@@ -1271,9 +1271,14 @@ class GenerationMixin:
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         cur_len = input_ids.shape[-1]
 
+        from transformers import MBart50TokenizerFast
+        tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+        count=0
+
         this_peer_finished = False  # used by synced_gpus only
         while True:
 
+            count=count+1
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -1319,11 +1324,34 @@ class GenerationMixin:
                         else (outputs.hidden_states,)
                     )
 
+            next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
+            next_token_scores = nn.functional.log_softmax(
+                next_token_logits, dim=-1
+            )
+
             # pre-process distribution
-            next_tokens_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = logits_processor(input_ids, next_token_scores)
+
+            next_5_token_scores, next_5_tokens = torch.topk(
+                # Returns the k largest elements of the given input tensor along a given dimension.
+                next_token_scores, 5, dim=1, largest=True, sorted=True
+            )
+
+            decoded_5_tokens_list=[]
+            for x, y in zip(next_5_tokens[0],next_5_token_scores[0]):
+                decoded_token = tokenizer.decode(x, skip_special_tokens=True)
+                s= str(x.item()) + ": " + decoded_token + " (" + str(y.item()) + ")"
+                decoded_5_tokens_list.append(s)
+
+            if count ==1 and next_5_tokens[0][0] == 250004:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            else:
+                print("Possible top 5 next tokens: {}".format(decoded_5_tokens_list))
+                num1 = int(input("Pick a next token ID: "))
+                next_tokens = num1
 
             # argmax
-            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+            # next_tokens = torch.argmax(next_tokens_scores, dim=-1)
 
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
@@ -1340,6 +1368,8 @@ class GenerationMixin:
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id is not None:
                 unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+
+            print("Output: {}".format(tokenizer.batch_decode(input_ids, skip_special_tokens=True)))
 
             # stop when each sentence is finished, or if we exceed the maximum length
             if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
@@ -1769,6 +1799,11 @@ class GenerationMixin:
         beam_scores[:, 1:] = -1e9
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
+        from transformers import MBart50TokenizerFast
+        tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+        line_items = []
+        line_items_scores=[]
+
         this_peer_finished = False  # used by synced_gpus only
         while True:
 
@@ -1794,14 +1829,14 @@ class GenerationMixin:
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
-
+            # here we can get logits of next token
             next_token_logits = outputs.logits[:, -1, :]
             # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id`
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
             next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
-            )  # (batch_size * num_beams, vocab_size)
+            )  # (batch_size * num_beams, vocab_size) (IMPORTANT where logits pass to softmax layer and get the probability score)
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
@@ -1826,9 +1861,9 @@ class GenerationMixin:
 
             # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
-            next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
+            next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size) #tensor([[-16.8717, -16.9149, -13.9981,  ..., -24.0156, -28.2072, -19.7235]])
 
-            next_token_scores, next_tokens = torch.topk(
+            next_token_scores, next_tokens = torch.topk( # Returns the k largest elements of the given input tensor along a given dimension.
                 next_token_scores, 2 * num_beams, dim=1, largest=True, sorted=True
             )
 
@@ -1847,6 +1882,14 @@ class GenerationMixin:
             beam_scores = beam_outputs["next_beam_scores"]
             beam_next_tokens = beam_outputs["next_beam_tokens"]
             beam_idx = beam_outputs["next_beam_indices"]
+
+            x_beam_next_tokens = tokenizer.batch_decode(beam_next_tokens, skip_special_tokens=True)
+            x_next_tokens = tokenizer.batch_decode(next_tokens, skip_special_tokens=True)
+            line_items.append(beam_next_tokens)
+            line_items_scores.append(beam_scores)
+
+            print("next_tokens:{}:{}:{}:{}".format(next_tokens, x_next_tokens, next_token_scores, next_indices))
+            print("beam_next_tokens:{}:{}:{}:{}\n".format(beam_next_tokens, x_beam_next_tokens, beam_scores, beam_idx))
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
