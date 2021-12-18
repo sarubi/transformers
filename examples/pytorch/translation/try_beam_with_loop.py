@@ -42,3 +42,6 @@ while output_sequence_eos_found==False:
     output_sequence.append(next_tokens)
     if next_tokens==2:
         output_sequence_eos_found = True
+
+
+print("Partial output:- token IDs: {}, tokens: [{}]".format(output_sequence, tokenizer.decode(output_sequence, skip_special_tokens=True)))
